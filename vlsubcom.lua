@@ -38,10 +38,10 @@ Manual Install:
    - macOS: ~/Library/Application Support/org.videolan.vlc/lua/extensions/
    - Linux: ~/.local/share/vlc/lua/extensions/
 3. Restart VLC Media Player
-4. Access via View → VLSub OpenSubtitles.com
+4. Access via VLC → Extensions → VLSub OpenSubtitles.com
 
 USAGE:
-1. Setup: Open VLC → View → VLSub OpenSubtitles.com → Config
+1. Setup: Open VLC → VLC → Extensions → VLSub OpenSubtitles.com → Config
 2. Login: Enter your OpenSubtitles.com username and password
 3. Play: Start your video file
 4. Search: Click "🎯 Search by Hash" or "🔍 Search by Name"
@@ -179,6 +179,7 @@ local options = {
   language3 = nil,  -- Third language
   sortBy = nil,     -- API order_by
   sortDirection = "desc", -- API order_direction
+  autoFetch = true,
   downloadBehaviour = 'save',
   langExt = true,
   removeTag = false,
@@ -234,6 +235,7 @@ local options = {
     int_second_lang = '2. Subtitles Language',            -- Updated
     int_third_lang = '3. Subtitles Language',             -- Updated
     int_dowload_behav = 'What to do with subtitles',
+    int_auto_fetch = 'Auto-fetch subtitles on media open',
     int_dowload_save = 'Load and save',
     int_dowload_load = 'Load only',
     int_dowload_manual =  'Manual download',
@@ -493,6 +495,15 @@ Curl.__index = Curl
 local last_click_time = 0
 local last_click_item = 0
 local double_click_threshold = 500 -- milliseconds
+local auto_fetch_state = {
+  last_uri = nil,
+  running = false,
+  retry_uri = nil,
+  retry_after = 0,
+  logged_no_input = false,
+  logged_handled_uri = nil,
+  logged_disabled = false
+}
 
 
             --[[ VLC extension stuff ]]--
@@ -859,9 +870,7 @@ end
 
 -- Optional: Add a preference to disable auto-search
 function is_auto_search_enabled()
-  -- You could add this to options if you want to make it configurable
-  -- For now, always enabled for better UX
-  return true
+  return openSub.option.autoFetch ~= false
 end
 
 
@@ -1014,7 +1023,7 @@ function get_install_instructions(download_url)
   table.insert(instructions, "")
   table.insert(instructions, "<b>After installation:</b>")
   table.insert(instructions, "• Restart VLC Media Player")
-  table.insert(instructions, "• Access via View → VLSub OpenSubtitles.com")
+  table.insert(instructions, "• Access via VLC → Extensions → VLSub OpenSubtitles.com")
 
   return table.concat(instructions, "<br>")
 end
@@ -1062,7 +1071,7 @@ function show_update_dialog(latest_version, release_notes, download_url)
     dlg:add_label(install_path, 1, 6, 6, 1)
   end
 
-  dlg:add_label("Then restart VLC and access via View → VLSub OpenSubtitles.com", 1, 7, 6, 1)
+  dlg:add_label("Then restart VLC and access via VLC → Extensions → VLSub OpenSubtitles.com", 1, 7, 6, 1)
 
   -- Row 8: What's new section (compact - exactly 6 lines)
   dlg:add_label("<b>What's New in v" .. latest_version .. ":</b>", 1, 8, 6, 1)
@@ -1158,12 +1167,12 @@ function process_release_notes(notes)
   -- Split into individual features and clean up
   local features = {}
   for line in processed:gmatch("[^\n]+") do
-    line = string.gsub(line, "^%s*", "") -- Remove leading spaces
-    line = string.gsub(line, "%s*$", "") -- Remove trailing spaces
+    local cleaned_line = string.gsub(line, "^%s*", "") -- Remove leading spaces
+    cleaned_line = string.gsub(cleaned_line, "%s*$", "") -- Remove trailing spaces
 
     -- Skip empty lines and section headers
-    if line ~= "" and not string.match(line, "^[A-Z][a-z]+%s*$") then
-      table.insert(features, line)
+    if cleaned_line ~= "" and not string.match(cleaned_line, "^[A-Z][a-z]+%s*$") then
+      table.insert(features, cleaned_line)
     end
   end
 
@@ -1723,6 +1732,7 @@ function menu()
 end
 
 function meta_changed()
+  auto_fetch_subtitle_for_current_media("meta_changed")
   return false
 end
 
@@ -1793,6 +1803,9 @@ function interface_main()
     "🔗 Link", open_subtitle_link, 2, 11, 1, 1)
 
   dlg:add_button(
+    "⚡ Auto", function() auto_fetch_subtitle_for_current_media("manual_button", true) end, 3, 11, 1, 1)
+
+  dlg:add_button(
     "⚙️ Config", show_conf, 5, 11, 1, 1)
   dlg:add_button(
     "❓ Help",
@@ -1841,59 +1854,67 @@ function interface_config()
   dlg:add_label(lang["int_dowload_behav"]..":", 1, 6, 2, 1)
   input_table['downloadBehaviour'] = dlg:add_dropdown(3, 6, 1, 1)
 
-  -- Row 7: Display language code
-  dlg:add_label(lang["int_display_code"]..":", 1, 7, 2, 1)
-  input_table['langExt'] = dlg:add_dropdown(3, 7, 1, 1)
+  -- Row 7: Auto-fetch subtitles
+  dlg:add_label(lang["int_auto_fetch"]..":", 1, 7, 2, 1)
+  input_table['autoFetch'] = dlg:add_dropdown(3, 7, 1, 1)
 
-  -- Row 8: Remove tags
-  dlg:add_label(lang["int_remove_tag"]..":", 1, 8, 2, 1)
-  input_table['removeTag'] = dlg:add_dropdown(3, 8, 1, 1)
+  -- Row 8: Display language code
+  dlg:add_label(lang["int_display_code"]..":", 1, 8, 2, 1)
+  input_table['langExt'] = dlg:add_dropdown(3, 8, 1, 1)
+
+  -- Row 9: Remove tags
+  dlg:add_label(lang["int_remove_tag"]..":", 1, 9, 2, 1)
+  input_table['removeTag'] = dlg:add_dropdown(3, 9, 1, 1)
 
   -- REMOVED: Row 9: Use curl option (no longer needed)
 
-  -- Row 9: Working directory (moved up from row 10)
+  -- Row 10: Working directory
   if openSub.conf.dirPath then
     if openSub.conf.os == "lin" then
-      dlg:add_label(lang["int_vlsub_work_dir"], 1, 9, 2, 1)
+      dlg:add_label(lang["int_vlsub_work_dir"], 1, 10, 2, 1)
     elseif openSub.conf.os == "win" then
       dlg:add_label(
         "<a href='file:///"..openSub.conf.dirPath.."'>"..
-        lang["int_vlsub_work_dir"].."</a>", 1, 9, 2, 1)
+        lang["int_vlsub_work_dir"].."</a>", 1, 10, 2, 1)
     else
       dlg:add_label(
         "<a href='"..openSub.conf.dirPath.."'>"..
-        lang["int_vlsub_work_dir"].."</a>", 1, 9, 2, 1)
+        lang["int_vlsub_work_dir"].."</a>", 1, 10, 2, 1)
     end
   else
-    dlg:add_label(lang["int_vlsub_work_dir"], 1, 9, 2, 1)
+    dlg:add_label(lang["int_vlsub_work_dir"], 1, 10, 2, 1)
   end
 
   input_table['dir_path'] = dlg:add_text_input(
-    openSub.conf.dirPath, 2, 9, 2, 1)
+    openSub.conf.dirPath, 2, 10, 2, 1)
 
-  -- Row 10: Status message (moved up from row 11)
+  -- Row 11: Status message
   input_table['message'] = nil
-  input_table['message'] = dlg:add_label('', 1, 10, 4, 1)
+  input_table['message'] = dlg:add_label('', 1, 11, 4, 1)
 
-  -- Row 11: Action buttons (moved up from row 12)
+  -- Row 12: Action buttons
   dlg:add_button(
     "💾 " .. lang["int_save"],
-    apply_config, 1, 11, 1, 1)
+    apply_config, 1, 12, 1, 1)
 
   dlg:add_button(
     "❓ " .. lang["int_help"],
     function() show_help("config") end,
-    2, 11, 1, 1)
+    2, 12, 1, 1)
 
   dlg:add_button(
     "🔄 Check Updates",
-    function() check_for_updates(true) end, 3, 11, 1, 1)
+    function() check_for_updates(true) end, 3, 12, 1, 1)
 
   dlg:add_button(
     "❌ " .. lang["int_close"],
-    show_main, 4, 11, 1, 1)
+    show_main, 4, 12, 1, 1)
 
   -- Setup dropdown values for existing dropdowns
+  input_table['autoFetch']:add_value(
+    lang["int_bool_"..tostring(openSub.option.autoFetch)], 1)
+  input_table['autoFetch']:add_value(
+    lang["int_bool_"..tostring(not openSub.option.autoFetch)], 2)
   input_table['langExt']:add_value(
     lang["int_bool_"..tostring(openSub.option.langExt)], 1)
   input_table['langExt']:add_value(
@@ -1986,19 +2007,7 @@ end
 function show_main()
   trigger_menu(1)
 
-  -- After showing the main interface, check if we should auto-search
-  if should_auto_search() then
-    vlc.msg.dbg("[VLSub] Auto-searching subtitles for loaded media...")
-
-    -- Small delay to ensure interface is fully loaded
-    local start_time = os.clock()
-    while (os.clock() - start_time) < 0.1 do
-      -- Brief delay
-    end
-
-    -- Automatically trigger hash search (which includes name search fallback)
-    searchHash()
-  end
+  auto_fetch_subtitle_for_current_media("show_main")
 end
 
 -- Modified show_conf function to pass the window identifier when calling help
@@ -2011,6 +2020,376 @@ function show_help(from_window)
     previous_window = from_window
   end
   trigger_menu(3)
+end
+
+function get_configured_languages_in_priority()
+  local configured = {}
+  local seen = {}
+  local option_keys = {"language", "language2", "language3"}
+
+  for _, key in ipairs(option_keys) do
+    local value = openSub.option[key]
+    if value and value ~= "" and value ~= "all" and
+       string.match(value, "^%a%a[%a%-]*$") and not seen[value] then
+      value = string.lower(value)
+      table.insert(configured, value)
+      seen[value] = true
+    end
+  end
+
+  return configured
+end
+
+function get_configured_languages_for_api()
+  local configured = get_configured_languages_in_priority()
+  if #configured == 0 then
+    return "en"
+  end
+
+  local sorted = {}
+  for _, lang_code in ipairs(configured) do
+    table.insert(sorted, lang_code)
+  end
+  table.sort(sorted)
+
+  return table.concat(sorted, ",")
+end
+
+function escape_lua_pattern(str)
+  return (str:gsub("([^%w])", "%%%1"))
+end
+
+function is_subtitle_extension(ext)
+  if not ext then
+    return false
+  end
+
+  ext = string.lower(ext)
+  return ext == "srt" or ext == "ass" or ext == "ssa" or
+    ext == "sub" or ext == "vtt" or ext == "smi" or ext == "sami"
+end
+
+function auto_fetch_log(message)
+  local line = os.date("%Y-%m-%d %H:%M:%S") .. " " .. tostring(message)
+  vlc.msg.dbg("[VLSub AutoFetch] " .. tostring(message))
+
+  if not openSub or not openSub.conf or not openSub.conf.dirPath then
+    return
+  end
+
+  local log_path = openSub.conf.dirPath .. slash .. "auto_fetch.log"
+  local f = io.open(log_path, "a")
+  if f then
+    f:write(line .. "\n")
+    f:close()
+  end
+end
+
+function find_existing_local_subtitle()
+  if not openSub.file.hasInput or not openSub.file.dir or not openSub.file.name then
+    return nil
+  end
+
+  if openSub.file.protocol ~= "file" or not is_dir(openSub.file.dir) then
+    return nil
+  end
+
+  local base_name = openSub.file.name
+  local configured_languages = get_configured_languages_in_priority()
+  local subtitle_extensions = {"srt", "ass", "ssa", "sub", "vtt", "smi", "sami"}
+  local candidates = {}
+
+  for _, ext in ipairs(subtitle_extensions) do
+    table.insert(candidates, openSub.file.dir .. base_name .. "." .. ext)
+  end
+
+  for _, lang_code in ipairs(configured_languages) do
+    for _, ext in ipairs(subtitle_extensions) do
+      table.insert(candidates, openSub.file.dir .. base_name .. "." .. lang_code .. "." .. ext)
+    end
+  end
+
+  for _, candidate in ipairs(candidates) do
+    if file_exist(candidate) then
+      return candidate
+    end
+  end
+
+  local dir_list = list_dir(openSub.file.dir)
+  if dir_list then
+    local base_pattern = "^" .. escape_lua_pattern(base_name) .. "%..+%.([%w]+)$"
+    local plain_pattern = "^" .. escape_lua_pattern(base_name) .. "%.([%w]+)$"
+
+    for _, filename in ipairs(dir_list) do
+      local ext = string.match(filename, base_pattern) or string.match(filename, plain_pattern)
+      if is_subtitle_extension(ext) then
+        return openSub.file.dir .. filename
+      end
+    end
+  end
+
+  return nil
+end
+
+function item_has_downloadable_file(item)
+  return item and item.FileID and tostring(item.FileID) ~= ""
+end
+
+function select_best_auto_subtitle()
+  if not openSub.itemStore or type(openSub.itemStore) ~= "table" or #openSub.itemStore == 0 then
+    return nil
+  end
+
+  local language_priority = {}
+  for rank, lang_code in ipairs(get_configured_languages_in_priority()) do
+    language_priority[lang_code] = rank
+  end
+
+  local best_item = nil
+  local best_score = nil
+
+  for _, item in ipairs(openSub.itemStore) do
+    if item_has_downloadable_file(item) then
+      local score = 0
+      local lang_rank = language_priority[item.SubLanguageID]
+
+      if lang_rank then
+        score = score + ((100 - lang_rank) * 10000)
+      elseif next(language_priority) == nil then
+        score = score + 10000
+      end
+
+      if item.MoviehashMatch then
+        score = score + 5000
+      end
+      if item.FromTrusted then
+        score = score + 1000
+      end
+      if item.HD then
+        score = score + 100
+      end
+      if item.AITranslated or item.MachineTranslated then
+        score = score - 250
+      end
+
+      local download_count = tonumber(item.SubDownloadsCnt) or 0
+      score = score + math.min(download_count, 1000)
+
+      if not best_score or score > best_score then
+        best_score = score
+        best_item = item
+      end
+    end
+  end
+
+  return best_item
+end
+
+function search_subtitles_for_auto_fetch()
+  openSub.itemStore = nil
+  openSub.getFileInfo()
+  openSub.getMovieInfo()
+  openSub.movie.sublanguageid = get_configured_languages_for_api()
+  auto_fetch_log("search start; title=" .. tostring(openSub.movie.title) ..
+    "; season=" .. tostring(openSub.movie.seasonNumber) ..
+    "; episode=" .. tostring(openSub.movie.episodeNumber) ..
+    "; year=" .. tostring(openSub.movie.year) ..
+    "; languages=" .. tostring(openSub.movie.sublanguageid))
+
+  if openSub.isLocalFileForHashing() and openSub.getMovieHash() then
+    openSub.lastSearchMethod = "hash"
+    auto_fetch_log("hash calculated; hash=" .. tostring(openSub.file.hash) ..
+      "; bytesize=" .. tostring(openSub.file.bytesize))
+    openSub.searchSubtitlesByHashNewAPI()
+  end
+
+  if openSub.itemStore and type(openSub.itemStore) == "table" and #openSub.itemStore > 0 then
+    auto_fetch_log("hash search results=" .. tostring(#openSub.itemStore))
+    return true
+  end
+
+  if not openSub.movie.title or openSub.movie.title == "" then
+    vlc.msg.dbg("[VLSub] Auto-fetch skipped: no title available for fallback name search")
+    return false
+  end
+
+  openSub.lastSearchMethod = "hash_fallback"
+  openSub.searchSubtitlesNewAPI()
+  if openSub.itemStore and type(openSub.itemStore) == "table" then
+    auto_fetch_log("name search results=" .. tostring(#openSub.itemStore))
+  else
+    auto_fetch_log("name search itemStore=" .. tostring(openSub.itemStore) ..
+      "; type=" .. type(openSub.itemStore))
+  end
+
+  return openSub.itemStore and type(openSub.itemStore) == "table" and #openSub.itemStore > 0
+end
+
+function auto_fetch_subtitle_for_current_media(reason, force)
+  if auto_fetch_state.running then
+    auto_fetch_log("skip nested request; reason=" .. tostring(reason))
+    return false
+  end
+
+  if not is_auto_search_enabled() then
+    if not auto_fetch_state.logged_disabled then
+      auto_fetch_log("skip disabled; reason=" .. tostring(reason))
+      auto_fetch_state.logged_disabled = true
+    end
+    return false
+  end
+  auto_fetch_state.logged_disabled = false
+
+  openSub.getFileInfo()
+
+  if not openSub.file.hasInput or not openSub.file.uri then
+    auto_fetch_state.last_uri = nil
+    auto_fetch_state.logged_handled_uri = nil
+    if not auto_fetch_state.logged_no_input then
+      auto_fetch_log("skip no media input; reason=" .. tostring(reason))
+      auto_fetch_state.logged_no_input = true
+    end
+    return false
+  end
+  auto_fetch_state.logged_no_input = false
+
+  local current_uri = openSub.file.uri
+  if auto_fetch_state.retry_uri == current_uri and os.time() < auto_fetch_state.retry_after and not force then
+    return false
+  end
+
+  if not force and current_uri == auto_fetch_state.last_uri then
+    if auto_fetch_state.logged_handled_uri ~= current_uri then
+      auto_fetch_log("skip already handled current media; uri=" .. tostring(current_uri))
+      auto_fetch_state.logged_handled_uri = current_uri
+    end
+    return false
+  end
+
+  auto_fetch_log("trigger reason=" .. tostring(reason) ..
+    "; force=" .. tostring(force == true) ..
+    "; protocol=" .. tostring(openSub.file.protocol) ..
+    "; uri=" .. tostring(current_uri))
+
+  if openSub.file.protocol ~= "file" then
+    auto_fetch_log("skip non-local protocol=" .. tostring(openSub.file.protocol))
+    return false
+  end
+
+  if not is_authenticated and not has_valid_authentication() then
+    auto_fetch_log("skip authentication unavailable")
+    return false
+  end
+
+  local existing_subtitle = find_existing_local_subtitle()
+  if existing_subtitle then
+    auto_fetch_state.last_uri = current_uri
+    auto_fetch_log("existing local subtitle found; path=" .. existing_subtitle)
+    auto_fetch_log("existing local subtitle load result=" .. tostring(add_sub(existing_subtitle)))
+    setMessage(success_tag("Existing local subtitle found; skipped auto-download"))
+    return true
+  end
+
+  auto_fetch_state.running = true
+  setMessage(loading_tag("Auto-fetching subtitles..."))
+
+  local ok, success = pcall(function()
+    if not search_subtitles_for_auto_fetch() then
+      auto_fetch_state.last_uri = current_uri
+      auto_fetch_log("search completed without results")
+      setMessage(error_tag("Auto-fetch found no matching subtitles"))
+      return false
+    end
+
+    local item = select_best_auto_subtitle()
+    if not item then
+      auto_fetch_state.last_uri = current_uri
+      auto_fetch_log("results found but no downloadable item")
+      setMessage(error_tag("Auto-fetch found subtitles but none were downloadable"))
+      return false
+    end
+
+    openSub.actionLabel = lang["mess_downloading"]
+    auto_fetch_log("downloading file_id=" .. tostring(item.FileID) ..
+      "; language=" .. tostring(item.SubLanguageID) ..
+      "; name=" .. tostring(item.SubFileName))
+
+    local downloaded = openSub.downloadFromNewAPI(item)
+    if downloaded then
+      auto_fetch_state.last_uri = current_uri
+      auto_fetch_state.retry_uri = nil
+      auto_fetch_state.retry_after = 0
+    else
+      auto_fetch_state.retry_uri = current_uri
+      auto_fetch_state.retry_after = os.time() + 60
+    end
+    auto_fetch_log("download result=" .. tostring(downloaded))
+    return downloaded
+  end)
+
+  auto_fetch_state.running = false
+
+  if not ok then
+    auto_fetch_state.retry_uri = current_uri
+    auto_fetch_state.retry_after = os.time() + 60
+    auto_fetch_log("runtime failure=" .. tostring(success))
+    setMessage(error_tag("Auto-fetch failed: " .. tostring(success)))
+    return false
+  end
+
+  return success
+end
+
+function vlsub_background_init()
+  auto_fetch_log("background init started")
+
+  local json_ok, json_module = pcall(require, "dkjson")
+  if not json_ok then
+    auto_fetch_log("background init failed: dkjson load error=" .. tostring(json_module))
+    return false
+  end
+
+  json = json_module
+  jsonModuleLoaded = true
+
+  if not check_dkjson_compatibility() then
+    auto_fetch_log("background init failed: incompatible dkjson")
+    return false
+  end
+
+  if not check_config() then
+    auto_fetch_log("background init failed: config check failed")
+    return false
+  end
+
+  configurationPassed = true
+  convert_sub_languages()
+  languages = sub_languages
+  openSub.conf.languages = languages
+
+  pcall(function()
+    initialize_languages()
+  end)
+
+  if vlc.input.item() then
+    openSub.getFileInfo()
+    openSub.getMovieInfo()
+  end
+
+  is_authenticated = has_valid_authentication()
+  if not is_authenticated then
+    local username = trim(openSub.option.os_username or "")
+    local password = trim(openSub.option.os_password or "")
+    is_authenticated = (username ~= "" and password ~= "")
+  end
+
+  initialization_complete = true
+  auto_fetch_log("background init complete; authenticated=" .. tostring(is_authenticated))
+  return true
+end
+
+function vlsub_background_tick()
+  return auto_fetch_subtitle_for_current_media("background_tick", false)
 end
 
 -- Function to determine if we should automatically search
@@ -2250,6 +2629,10 @@ end
 -- Enhanced display_subtitles function to show all-languages search info
 function display_subtitles()
   local mainlist = input_table["mainlist"]
+  if not mainlist then
+    return
+  end
+
   mainlist:clear()
 
   -- Safe check for no results - FIXED to avoid string/number comparison error
@@ -2837,7 +3220,12 @@ function getenv_lang()
   local os_lang = os.getenv("LANG")
 
   if os_lang then -- unix, mac
-    openSub.option.language = string.sub(os_lang, 0, 2)
+    local lang_code = string.match(os_lang, "^(%a%a)")
+    if lang_code then
+      openSub.option.language = string.lower(lang_code)
+    else
+      openSub.option.language = "en"
+    end
   else -- Windows
     local lang_w = string.match(
       os.setlocale("", "collate"),
@@ -2878,6 +3266,10 @@ function apply_config()
   openSub.option.os_password = password
 
   -- Save boolean options (these should always be saved regardless of login status)
+  if input_table["autoFetch"]:get_value() == 2 then
+    openSub.option.autoFetch = not openSub.option.autoFetch
+  end
+
   if input_table["langExt"]:get_value() == 2 then
     openSub.option.langExt = not openSub.option.langExt
   end
@@ -2903,9 +3295,9 @@ function apply_config()
       vlc.config.get(
         "sub-autodetect-path"):gmatch("[^,]+"
       ) do
-        path = trim(path)
-        if path ~= (openSub.conf.dirPath or "")..sub_dir then
-          table.insert(other_dirs, path)
+        local trimmed_path = trim(path)
+        if trimmed_path ~= (openSub.conf.dirPath or "")..sub_dir then
+          table.insert(other_dirs, trimmed_path)
         end
       end
       openSub.conf.dirPath = dir_path
@@ -2991,6 +3383,8 @@ function apply_config()
     if dlg then
       dlg:update()
     end
+
+    auto_fetch_subtitle_for_current_media("config_saved", true)
   else
     -- Login failed, but config was still saved
     is_authenticated = false
@@ -4220,9 +4614,11 @@ function progressBarContent(pct)
 end
 
 function setMessage(str)
-  if input_table["message"] then
+  if input_table and input_table["message"] then
     input_table["message"]:set_text(str)
-    dlg:update()
+    if dlg then
+      dlg:update()
+    end
   end
 end
 
@@ -4925,7 +5321,7 @@ function list_dir(path)
   local list = {}
 
   -- Method 1: Try VLC's built-in directory listing (if available)
-  if vlc.net and vlc.net.opendir then
+  if vlc.net and vlc.net.opendir and vlc.net.readdir and vlc.net.closedir then
     vlc.msg.dbg("[VLSub] Using VLC built-in directory listing")
     local dir_handle = vlc.net.opendir(path)
     if dir_handle then
@@ -6036,8 +6432,7 @@ function input_changed()
       subtitle_list_click_handler()
     end
   else
-    -- In main mode - normal behavior
-    set_interface_main()
+    auto_fetch_subtitle_for_current_media("input_changed")
     if input_table["mainlist"] then
       subtitle_list_click_handler()
     end
@@ -6258,7 +6653,10 @@ openSub.downloadFromNewAPI = function(item)
     local success_load_save = openSub.saveAndLoadSubtitle(subtitle_content, item)
     if success_load_save then
         -- Build enhanced message with quota info
-        local base_message = input_table["message"]:get_text()
+        local base_message = "Subtitles saved and loaded"
+        if input_table["message"] then
+            base_message = input_table["message"]:get_text()
+        end
 
         -- Extract the base success message (before any quota info)
         local clean_message = string.gsub(base_message, "<[^>]*>", "") -- Remove HTML tags
@@ -8093,6 +8491,7 @@ openSub.searchSubtitlesNewAPI = function()
   if openSub.option.debugLogging then
     vlc.msg.dbg("[VLSub] API URL (sorted params): " .. url)
   end
+  auto_fetch_log("name api url=" .. url)
 
   -- Make the API request with authentication
   local client = Curl.new()
@@ -8109,6 +8508,8 @@ openSub.searchSubtitlesNewAPI = function()
   client:set_retries(2)
 
   local res = client:get(url)
+  auto_fetch_log("name api status=" .. tostring(res and res.status) ..
+    "; body_len=" .. tostring(res and res.body and #res.body))
 
   if res and res.status == 200 and res.body then
     if openSub.option.debugLogging then
@@ -8117,11 +8518,14 @@ openSub.searchSubtitlesNewAPI = function()
     local ok, parsed_data = pcall(json.decode, res.body, 1, true)
     if ok and parsed_data and parsed_data.data then
       openSub.itemStore = openSub.convertNewAPIResponse(parsed_data.data)
+      auto_fetch_log("name api data_count=" .. tostring(#parsed_data.data) ..
+        "; converted_count=" .. tostring(type(openSub.itemStore) == "table" and #openSub.itemStore or openSub.itemStore))
       if openSub.option.debugLogging then
         vlc.msg.dbg("[VLSub] Found " .. #openSub.itemStore .. " subtitles")
       end
     else
       vlc.msg.err("[VLSub] Failed to parse API response: " .. (res.body or "no body"))
+      auto_fetch_log("name api parse failed; body_prefix=" .. string.sub(res.body or "", 1, 300))
       openSub.itemStore = "0"
     end
   elseif res and res.status == 301 then
@@ -8144,6 +8548,8 @@ openSub.searchSubtitlesNewAPI = function()
     if res.body then
       vlc.msg.err("[VLSub] Error response: " .. res.body)
     end
+    auto_fetch_log("name api failed status=" .. tostring(res.status) ..
+      "; body_prefix=" .. string.sub(res.body or "", 1, 300))
     openSub.itemStore = "0"
   else
     vlc.msg.err("[VLSub] API request failed - no response")
@@ -8212,6 +8618,7 @@ openSub.searchSubtitlesByHashNewAPI = function()
     if openSub.option.debugLogging then
       vlc.msg.dbg("[VLSub] Hash search API URL (sorted params): " .. url)
     end
+    auto_fetch_log("hash api url=" .. url)
 
     -- Make the API request with authentication
     local client = Curl.new()
@@ -8231,6 +8638,9 @@ openSub.searchSubtitlesByHashNewAPI = function()
     local request_ok, res = pcall(function()
         return client:get(url)
     end)
+    auto_fetch_log("hash api request_ok=" .. tostring(request_ok) ..
+      "; status=" .. tostring(res and res.status) ..
+      "; body_len=" .. tostring(res and res.body and #res.body))
 
     if not request_ok then
         -- HTTP request threw a Lua error
@@ -8248,6 +8658,8 @@ openSub.searchSubtitlesByHashNewAPI = function()
         local ok, parsed_data = pcall(json.decode, res.body, 1, true)
         if ok and parsed_data and parsed_data.data then
             openSub.itemStore = openSub.convertNewAPIResponse(parsed_data.data)
+            auto_fetch_log("hash api data_count=" .. tostring(#parsed_data.data) ..
+              "; converted_count=" .. tostring(type(openSub.itemStore) == "table" and #openSub.itemStore or openSub.itemStore))
             if openSub.option.debugLogging then
               vlc.msg.dbg("[VLSub] Found " .. #openSub.itemStore .. " subtitles by hash")
             end
@@ -8265,6 +8677,7 @@ openSub.searchSubtitlesByHashNewAPI = function()
             end
             vlc.msg.err("[VLSub] Failed to parse hash search API response")
             vlc.msg.dbg("[VLSub] Response body (first 500 chars): " .. string.sub(res.body or "", 1, 500))
+            auto_fetch_log("hash api parse failed; body_prefix=" .. string.sub(res.body or "", 1, 300))
             openSub.itemStore = {} -- Set to empty table
             setMessage(error_tag(lang["mess_no_res"]))
         end
